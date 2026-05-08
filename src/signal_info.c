@@ -1,7 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,6 +28,7 @@
 #define DATAON_FLAG_FILE "Req_PDUSessConn_enabled"
 #define DATAON_FLAG_CHECK_COMMAND "ls /var/tmp/ | grep Req_PDUSessConn_enabled"
 #define DATAON_FLAG_TOUCH_COMMAND "touch /var/tmp/Req_PDUSessConn_enabled"
+#define WSIGINFO_VERSION "2.0"
 
 #define DEBUG_LEVEL_DISABLE 0
 #define DEBUG_LEVEL_ALL 1
@@ -67,17 +69,21 @@ typedef struct {
   int max_try;
 } dataon_thread_arg_type;
 
-static pthread_t dataon_thread_id;
-
 static void print_usage(const char *prog_name)
 {
   fprintf(stderr,
-          "Usage: %s [-a ip_addr] [-n max_try] [-i interval_ms] [-d debug_level]\n"
+          "Usage: %s [-a ip_addr] [-n max_try] [-i interval_ms] [-d debug_level] [-v]\n"
           "  -a ip_addr      target ip address (default: 192.168.225.1)\n"
           "  -n max_try      retry count (default: %d)\n"
           "  -i interval_ms  retry interval in milliseconds (default: %d)\n"
-          "  -d debug_level  0=disable, 1=all, 2=important (default: %d)\n",
+          "  -d debug_level  0=disable, 1=all, 2=important (default: %d)\n"
+          "  -v              show version information\n",
           prog_name, DEFAULT_MAX_TRY, DEFAULT_RETRY_INTERVAL_MS, DEBUG_LEVEL_DISABLE);
+}
+
+static void print_version(void)
+{
+  printf("wsiginfo version %s\n", WSIGINFO_VERSION);
 }
 
 static int parse_int_arg(const char *opt_name, const char *opt_value, int *out_value)
@@ -125,6 +131,20 @@ static int normalize_max_try(int max_try)
 static void sleep_retry_interval_ms(int interval_ms)
 {
   usleep((useconds_t)interval_ms * 1000);
+}
+
+static void detach_worker_streams(void)
+{
+  int null_fd = open("/dev/null", O_RDWR);
+
+  if (null_fd < 0)
+    return;
+
+  dup2(null_fd, STDIN_FILENO);
+  dup2(null_fd, STDOUT_FILENO);
+
+  if (null_fd > STDOUT_FILENO)
+    close(null_fd);
 }
 
 static void disp_dump(const char *title, const char *buff, int total_len, int enable)
@@ -427,27 +447,43 @@ static int run_dataon_request(const char *ip_addr, int interval, int max_try)
   return -1;
 }
 
-static void *dataon_thread_main(void *arg)
+static int spawn_dataon_worker(const dataon_thread_arg_type *dataon_arg)
 {
-  dataon_thread_arg_type *thread_arg = (dataon_thread_arg_type *)arg;
+  pid_t pid = 0;
 
-  DEBUG_LOG_IMPORTANT("dataon_thread_main start: ip=%s interval_ms=%d max_try=%d",
-                      thread_arg->ip_addr, thread_arg->interval, thread_arg->max_try);
-  run_dataon_request(thread_arg->ip_addr, thread_arg->interval, thread_arg->max_try);
-  DEBUG_LOG_IMPORTANT("dataon_thread_main done");
+  pid = fork();
+  if (pid < 0) {
+    fprintf(stderr, "fork failed: %s\n", strerror(errno));
+    return -1;
+  }
 
-  return NULL;
+  if (pid > 0) {
+    DEBUG_LOG_IMPORTANT("dataon worker spawned: pid=%ld", (long)pid);
+    return 0;
+  }
+
+  DEBUG_LOG_IMPORTANT("dataon worker start: pid=%ld ip=%s interval_ms=%d max_try=%d",
+                      (long)getpid(), dataon_arg->ip_addr, dataon_arg->interval,
+                      dataon_arg->max_try);
+  if (setsid() < 0)
+    DEBUG_LOG_IMPORTANT("setsid failed: errno=%d", errno);
+  detach_worker_streams();
+
+  run_dataon_request(dataon_arg->ip_addr, dataon_arg->interval, dataon_arg->max_try);
+  _exit(0);
+
+  return 0;
 }
 
 int main(int argc, char **argv)
 {
   const char *ip_addr = "192.168.225.1";
   dataon_thread_arg_type dataon_arg = {{0,}, DEFAULT_RETRY_INTERVAL_MS, DEFAULT_MAX_TRY};
-  int dataon_thread_rc = 0;
+  int dataon_worker_rc = 0;
   int signal_info_rc = 0;
   int opt = 0;
 
-  while ((opt = getopt(argc, argv, "a:n:i:d:h")) != -1) {
+  while ((opt = getopt(argc, argv, "a:n:i:d:hv")) != -1) {
     switch (opt) {
       case 'a':
         ip_addr = optarg;
@@ -472,6 +508,9 @@ int main(int argc, char **argv)
         break;
       case 'h':
         print_usage(argv[0]);
+        return 0;
+      case 'v':
+        print_version();
         return 0;
       default:
         print_usage(argv[0]);
@@ -498,24 +537,11 @@ int main(int argc, char **argv)
                       g_debug_level
   );
   snprintf(dataon_arg.ip_addr, sizeof(dataon_arg.ip_addr), "%s", ip_addr);
-  dataon_thread_rc = pthread_create(&dataon_thread_id, NULL, dataon_thread_main, &dataon_arg);
-  if (dataon_thread_rc != 0) {
-    fprintf(stderr, "pthread_create failed: %s\n", strerror(dataon_thread_rc));
-  } else {
-    DEBUG_LOG_IMPORTANT("pthread_create success");
-  }
+  dataon_worker_rc = spawn_dataon_worker(&dataon_arg);
 
   signal_info_rc = run_signal_info(ip_addr, dataon_arg.interval, dataon_arg.max_try);
 
-  if (dataon_thread_rc == 0) {
-    int join_rc = pthread_join(dataon_thread_id, NULL);
-    if (join_rc != 0) {
-      fprintf(stderr, "pthread_join failed: %s\n", strerror(join_rc));
-      return 1;
-    }
-    DEBUG_LOG_IMPORTANT("pthread_join success");
-  }
-
-  DEBUG_LOG_IMPORTANT("main done: signal_info_rc=%d", signal_info_rc);
+  DEBUG_LOG_IMPORTANT("main done: signal_info_rc=%d dataon_worker_rc=%d",
+                      signal_info_rc, dataon_worker_rc);
   return signal_info_rc;
 }
