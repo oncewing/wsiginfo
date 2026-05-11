@@ -22,8 +22,8 @@
 #define SIGNAL_INFO_COMMAND 1
 #define DATAON_COMMAND 2
 #define SHELL_COMMAND 102
-#define DEFAULT_RETRY_INTERVAL_MS 50
-#define DEFAULT_MAX_TRY 3
+#define DEFAULT_RETRY_INTERVAL_MS 100
+#define DEFAULT_MAX_TRY 5
 #define DATAON_AT_COMMAND "AT*W4CMD=Req_PDUSessConn"
 #define DATAON_FLAG_FILE "Req_PDUSessConn_enabled"
 #define DATAON_FLAG_CHECK_COMMAND "ls /var/tmp/ | grep Req_PDUSessConn_enabled"
@@ -393,7 +393,7 @@ static int run_signal_info(const char *ip_addr, int interval, int max_try)
 
   DEBUG_LOG_IMPORTANT("run_signal_info done: success=%d result=\"%s\"", all_ok, total_result_str);
   printf("%s\n", total_result_str);
-  return 0;
+  return all_ok ? 0 : 1;
 }
 
 static int run_dataon_request(const char *ip_addr, int interval, int max_try)
@@ -536,12 +536,18 @@ int main(int argc, char **argv)
                       ip_addr, dataon_arg.interval, dataon_arg.max_try,
                       g_debug_level
   );
-  snprintf(dataon_arg.ip_addr, sizeof(dataon_arg.ip_addr), "%s", ip_addr);
-  dataon_worker_rc = spawn_dataon_worker(&dataon_arg);
-
   signal_info_rc = run_signal_info(ip_addr, dataon_arg.interval, dataon_arg.max_try);
+  if (signal_info_rc == 0) {
+    snprintf(dataon_arg.ip_addr, sizeof(dataon_arg.ip_addr), "%s", ip_addr);
+    dataon_worker_rc = spawn_dataon_worker(&dataon_arg);
+  } else {
+    DEBUG_LOG_IMPORTANT("skip dataon worker: signal_info failed");
+  }
 
   DEBUG_LOG_IMPORTANT("main done: signal_info_rc=%d dataon_worker_rc=%d",
                       signal_info_rc, dataon_worker_rc);
-  return signal_info_rc;
+  if (signal_info_rc != 0)
+    return signal_info_rc;
+
+  return (dataon_worker_rc == 0) ? 0 : 1;
 }
