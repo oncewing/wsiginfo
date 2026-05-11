@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <limits.h>
+#include <net/if.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,6 +21,7 @@
 #define DEF_OPT_ARR { "ant_bar", "nr_rsrp", "nr_rsrq", "nr_sinr" }
 
 #define SRSD_PORT 5002
+#define VERSION_COMMAND 0
 #define SIGNAL_INFO_COMMAND 1
 #define DATAON_COMMAND 2
 #define SHELL_COMMAND 102
@@ -334,6 +337,91 @@ static int extract_response_payload(const char *recv_buf, int recv_len,
   return 0;
 }
 
+static void probe_srs_ip(const char *srs_ip)
+{
+  char recv_buf[2048] = {0,};
+  char payload_buf[256] = {0,};
+  char imei[256] = {0,};
+  char dir_number[256] = {0,};
+  int len = -1;
+
+  len = send_srs_request(srs_ip, VERSION_COMMAND, NULL, recv_buf, sizeof(recv_buf), 0);
+  if (len <= 0
+      || extract_response_payload(recv_buf, len, payload_buf, sizeof(payload_buf)) != 0) {
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: no response from %s", srs_ip);
+    return;
+  }
+
+  DEBUG_LOG_IMPORTANT("log_srs_status_info: srs version from %s: \"%s\"", srs_ip, payload_buf);
+
+  memset(recv_buf, 0, sizeof(recv_buf));
+  len = send_srs_request(srs_ip, SIGNAL_INFO_COMMAND, "imei", recv_buf, sizeof(recv_buf), 0);
+  if (len <= 0
+      || extract_response_payload(recv_buf, len, imei, sizeof(imei)) != 0) {
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: imei query failed for %s", srs_ip);
+    snprintf(imei, sizeof(imei), "N/A");
+  }
+
+  memset(recv_buf, 0, sizeof(recv_buf));
+  len = send_srs_request(srs_ip, SIGNAL_INFO_COMMAND, "dir_number",
+                         recv_buf, sizeof(recv_buf), 0);
+  if (len <= 0
+      || extract_response_payload(recv_buf, len, dir_number, sizeof(dir_number)) != 0) {
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: dir_number query failed for %s", srs_ip);
+    snprintf(dir_number, sizeof(dir_number), "N/A");
+  }
+
+  DEBUG_LOG_IMPORTANT("status: %s %s %s", srs_ip, imei, dir_number);
+}
+
+static void log_srs_status_info(void)
+{
+  struct ifaddrs *ifaddr = NULL;
+  struct ifaddrs *ifa = NULL;
+  bool default_probed = false;
+  const char *default_ip = "192.168.225.1";
+
+  if (getifaddrs(&ifaddr) != 0) {
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: getifaddrs failed errno=%d", errno);
+    goto probe_default;
+  }
+
+  for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    char ip_str[INET_ADDRSTRLEN] = {0,};
+    char srs_ip[INET_ADDRSTRLEN] = {0,};
+    struct in_addr *addr = NULL;
+    unsigned char *b = NULL;
+
+    if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+      continue;
+
+    addr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+    if (inet_ntop(AF_INET, addr, ip_str, sizeof(ip_str)) == NULL)
+      continue;
+
+    if (strncmp(ip_str, "192.", 4) != 0)
+      continue;
+
+    b = (unsigned char *)&addr->s_addr;
+    snprintf(srs_ip, sizeof(srs_ip), "%u.%u.%u.1", b[0], b[1], b[2]);
+
+    if (strcmp(srs_ip, default_ip) == 0)
+      default_probed = true;
+
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: probe ip=%s (iface=%s local=%s)",
+                        srs_ip, ifa->ifa_name, ip_str);
+    probe_srs_ip(srs_ip);
+  }
+
+  freeifaddrs(ifaddr);
+
+probe_default:
+  if (!default_probed) {
+    DEBUG_LOG_IMPORTANT("log_srs_status_info: probe default ip=%s", default_ip);
+    probe_srs_ip(default_ip);
+  }
+}
+
 static int run_signal_info(const char *ip_addr, int interval, int max_try)
 {
   int attempt = 0;
@@ -536,6 +624,10 @@ int main(int argc, char **argv)
                       ip_addr, dataon_arg.interval, dataon_arg.max_try,
                       g_debug_level
   );
+
+  if (g_debug_level != DEBUG_LEVEL_DISABLE)
+    log_srs_status_info();
+
   signal_info_rc = run_signal_info(ip_addr, dataon_arg.interval, dataon_arg.max_try);
   if (signal_info_rc == 0) {
     snprintf(dataon_arg.ip_addr, sizeof(dataon_arg.ip_addr), "%s", ip_addr);
