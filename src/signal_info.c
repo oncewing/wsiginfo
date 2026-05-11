@@ -31,7 +31,7 @@
 #define DATAON_FLAG_FILE "Req_PDUSessConn_enabled"
 #define DATAON_FLAG_CHECK_COMMAND "ls /var/tmp/ | grep Req_PDUSessConn_enabled"
 #define DATAON_FLAG_TOUCH_COMMAND "touch /var/tmp/Req_PDUSessConn_enabled"
-#define WSIGINFO_VERSION "2.0"
+#define WSIGINFO_VERSION "3.0"
 
 #define DEBUG_LEVEL_DISABLE 0
 #define DEBUG_LEVEL_ALL 1
