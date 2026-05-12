@@ -25,19 +25,29 @@
 #define SIGNAL_INFO_COMMAND 1
 #define DATAON_COMMAND 2
 #define SHELL_COMMAND 102
-#define DEFAULT_RETRY_INTERVAL_MS 100
+#define DEFAULT_RETRY_INTERVAL_MS 50
 #define DEFAULT_MAX_TRY 5
+#define DEFAULT_RECV_TIMEOUT_MS 1500
+#define DATAON_RECV_TIMEOUT_MS 5000
 #define DATAON_AT_COMMAND "AT*W4CMD=Req_PDUSessConn"
 #define DATAON_FLAG_FILE "Req_PDUSessConn_enabled"
 #define DATAON_FLAG_CHECK_COMMAND "ls /var/tmp/ | grep Req_PDUSessConn_enabled"
 #define DATAON_FLAG_TOUCH_COMMAND "touch /var/tmp/Req_PDUSessConn_enabled"
-#define WSIGINFO_VERSION "3.0"
+#define WSIGINFO_VERSION "4.0"
 
 #define DEBUG_LEVEL_DISABLE 0
 #define DEBUG_LEVEL_ALL 1
 #define DEBUG_LEVEL_IMPORTANT 2
 
 static int g_debug_level = DEBUG_LEVEL_DISABLE;
+static int g_default_recv_timeout_ms = DEFAULT_RECV_TIMEOUT_MS;
+static int g_dataon_recv_timeout_ms = DATAON_RECV_TIMEOUT_MS;
+
+static int send_srs_request(const char *ip_addr, unsigned short command,
+                            const char *payload, char *recv_buf, size_t recv_buf_size,
+                            int enable_dump, int timeout_ms);
+static int extract_response_payload(const char *recv_buf, int recv_len,
+                                    char *payload_buf, size_t payload_buf_size);
 
 static void debug_log_impl(int level, const char *fmt, ...)
 {
@@ -75,13 +85,32 @@ typedef struct {
 static void print_usage(const char *prog_name)
 {
   fprintf(stderr,
-          "Usage: %s [-a ip_addr] [-n max_try] [-i interval_ms] [-d debug_level] [-v]\n"
-          "  -a ip_addr      target ip address (default: 192.168.225.1)\n"
-          "  -n max_try      retry count (default: %d)\n"
-          "  -i interval_ms  retry interval in milliseconds (default: %d)\n"
-          "  -d debug_level  0=disable, 1=all, 2=important (default: %d)\n"
-          "  -v              show version information\n",
-          prog_name, DEFAULT_MAX_TRY, DEFAULT_RETRY_INTERVAL_MS, DEBUG_LEVEL_DISABLE);
+          "Usage: %s [-a ip_addr] [-n max_try] [-i interval_ms] [-d debug_level] [-t default_ms,dataon_ms] [-s] [-v]\n"
+          "  -a ip_addr               target ip address (default: 192.168.225.1)\n"
+          "  -n max_try               retry count (default: %d)\n"
+          "  -i interval_ms           retry interval in milliseconds (default: %d)\n"
+          "  -d debug_level           0=disable, 1=all, 2=important (default: %d)\n"
+          "  -t default_ms,dataon_ms  recv timeout in ms (default: %d,%d)\n"
+          "  -s                       show data status (DATA ON/DATA OFF) and exit\n"
+          "  -v                       show version information\n",
+          prog_name, DEFAULT_MAX_TRY, DEFAULT_RETRY_INTERVAL_MS, DEBUG_LEVEL_DISABLE,
+          g_default_recv_timeout_ms, g_dataon_recv_timeout_ms);
+}
+
+static void print_data_status(const char *ip_addr)
+{
+  char recv_buf[2048] = {0,};
+  char shell_result[1024] = {0,};
+  int len = -1;
+
+  len = send_srs_request(ip_addr, SHELL_COMMAND, DATAON_FLAG_CHECK_COMMAND,
+                         recv_buf, sizeof(recv_buf), 0, g_default_recv_timeout_ms);
+  if (len > 0
+      && extract_response_payload(recv_buf, len, shell_result, sizeof(shell_result)) == 0
+      && strstr(shell_result, DATAON_FLAG_FILE) != NULL)
+    printf("DATA ON\n");
+  else
+    printf("DATA OFF\n");
 }
 
 static void print_version(void)
@@ -112,6 +141,45 @@ static int parse_int_arg(const char *opt_name, const char *opt_value, int *out_v
   }
 
   *out_value = (int)parsed;
+  return 0;
+}
+
+static int parse_timeout_arg(const char *opt_value)
+{
+  int default_ms = 0;
+  int dataon_ms = 0;
+  char *end_ptr = NULL;
+  const char *comma = NULL;
+  long parsed = 0;
+
+  if (opt_value == NULL || *opt_value == '\0') {
+    fprintf(stderr, "missing value for -t\n");
+    return -1;
+  }
+
+  comma = strchr(opt_value, ',');
+  if (comma == NULL) {
+    fprintf(stderr, "invalid format for -t: expected default_ms,dataon_ms\n");
+    return -1;
+  }
+
+  errno = 0;
+  parsed = strtol(opt_value, &end_ptr, 10);
+  if (errno != 0 || end_ptr == opt_value || end_ptr != comma || parsed < 1 || parsed > INT_MAX) {
+    fprintf(stderr, "invalid default_ms value for -t: %s\n", opt_value);
+    return -1;
+  }
+  default_ms = (int)parsed;
+
+  if (parse_int_arg("-t(dataon)", comma + 1, &dataon_ms) != 0)
+    return -1;
+  if (dataon_ms < 1) {
+    fprintf(stderr, "invalid dataon_ms value for -t: must be > 0\n");
+    return -1;
+  }
+
+  g_default_recv_timeout_ms = default_ms;
+  g_dataon_recv_timeout_ms = dataon_ms;
   return 0;
 }
 
@@ -210,7 +278,7 @@ static void add_crc16(unsigned char *data, unsigned int length)
 
 static int send_srs_request(const char *ip_addr, unsigned short command,
                             const char *payload, char *recv_buf, size_t recv_buf_size,
-                            int enable_dump)
+                            int enable_dump, int timeout_ms)
 {
   int sock = -1;
   int len = -1;
@@ -240,8 +308,8 @@ static int send_srs_request(const char *ip_addr, unsigned short command,
     memcpy(packet + sizeof(header), payload, payload_len);
 
   add_crc16(packet, packet_size - 2);
-  DEBUG_LOG_ALL("send_srs_request start: ip=%s command=%u payload=\"%s\" packet_size=%d",
-                ip_addr, command, payload ? payload : "", packet_size);
+  DEBUG_LOG_ALL("send_srs_request start: ip=%s command=%u payload=\"%s\" packet_size=%d timeout_ms=%d",
+                ip_addr, command, payload ? payload : "", packet_size, timeout_ms);
   disp_dump("SEND", (const char *)packet, packet_size, enable_dump);
 
   sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -251,8 +319,8 @@ static int send_srs_request(const char *ip_addr, unsigned short command,
     return -1;
   }
 
-  tv.tv_sec = RCV_TIMEOUT_S;
-  tv.tv_usec = RCV_TIMEOUT_US;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
     DEBUG_LOG_IMPORTANT("setsockopt failed: command=%u errno=%d", command, errno);
@@ -345,7 +413,8 @@ static void probe_srs_ip(const char *srs_ip)
   char dir_number[256] = {0,};
   int len = -1;
 
-  len = send_srs_request(srs_ip, VERSION_COMMAND, NULL, recv_buf, sizeof(recv_buf), 0);
+  len = send_srs_request(srs_ip, VERSION_COMMAND, NULL, recv_buf, sizeof(recv_buf), 0,
+                         g_default_recv_timeout_ms);
   if (len <= 0
       || extract_response_payload(recv_buf, len, payload_buf, sizeof(payload_buf)) != 0) {
     DEBUG_LOG_IMPORTANT("log_srs_status_info: no response from %s", srs_ip);
@@ -355,7 +424,8 @@ static void probe_srs_ip(const char *srs_ip)
   DEBUG_LOG_IMPORTANT("log_srs_status_info: srs version from %s: \"%s\"", srs_ip, payload_buf);
 
   memset(recv_buf, 0, sizeof(recv_buf));
-  len = send_srs_request(srs_ip, SIGNAL_INFO_COMMAND, "imei", recv_buf, sizeof(recv_buf), 0);
+  len = send_srs_request(srs_ip, SIGNAL_INFO_COMMAND, "imei", recv_buf, sizeof(recv_buf), 0,
+                         g_default_recv_timeout_ms);
   if (len <= 0
       || extract_response_payload(recv_buf, len, imei, sizeof(imei)) != 0) {
     DEBUG_LOG_IMPORTANT("log_srs_status_info: imei query failed for %s", srs_ip);
@@ -364,7 +434,7 @@ static void probe_srs_ip(const char *srs_ip)
 
   memset(recv_buf, 0, sizeof(recv_buf));
   len = send_srs_request(srs_ip, SIGNAL_INFO_COMMAND, "dir_number",
-                         recv_buf, sizeof(recv_buf), 0);
+                         recv_buf, sizeof(recv_buf), 0, g_default_recv_timeout_ms);
   if (len <= 0
       || extract_response_payload(recv_buf, len, dir_number, sizeof(dir_number)) != 0) {
     DEBUG_LOG_IMPORTANT("log_srs_status_info: dir_number query failed for %s", srs_ip);
@@ -450,7 +520,7 @@ static int run_signal_info(const char *ip_addr, int interval, int max_try)
 
       DEBUG_LOG_ALL("signal_info request: para=%s attempt=%d", para_arr[para_idx], attempt);
       len = send_srs_request(ip_addr, SIGNAL_INFO_COMMAND, para_arr[para_idx],
-                             recv_buf, sizeof(recv_buf), enable_dump);
+                             recv_buf, sizeof(recv_buf), enable_dump, g_default_recv_timeout_ms);
       if (len > 0
           && extract_response_payload(recv_buf, len, result_str, sizeof(result_str)) == 0) {
         DEBUG_LOG_ALL("signal_info response: para=%s value=\"%s\"", para_arr[para_idx], result_str);
@@ -500,7 +570,7 @@ static int run_dataon_request(const char *ip_addr, int interval, int max_try)
   for (attempt = 1; attempt <= max_try; attempt++) {
     DEBUG_LOG_IMPORTANT("dataon attempt start: attempt=%d", attempt);
     len = send_srs_request(ip_addr, SHELL_COMMAND, DATAON_FLAG_CHECK_COMMAND,
-                           recv_buf, sizeof(recv_buf), 0);
+                           recv_buf, sizeof(recv_buf), 0, g_default_recv_timeout_ms);
     if (len > 0
         && extract_response_payload(recv_buf, len, shell_result, sizeof(shell_result)) == 0
         && strstr(shell_result, DATAON_FLAG_FILE) != NULL) {
@@ -512,14 +582,14 @@ static int run_dataon_request(const char *ip_addr, int interval, int max_try)
     memset(recv_buf, 0x00, sizeof(recv_buf));
     memset(result_str, 0x00, sizeof(result_str));
     len = send_srs_request(ip_addr, DATAON_COMMAND, DATAON_AT_COMMAND,
-                           recv_buf, sizeof(recv_buf), 0);
+                           recv_buf, sizeof(recv_buf), 0, g_dataon_recv_timeout_ms);
     if (len > 0
         && extract_response_payload(recv_buf, len, result_str, sizeof(result_str)) == 0
         && strstr(result_str, "OK") != NULL) {
       DEBUG_LOG_ALL("Req_PDUSessConn success");
       memset(recv_buf, 0x00, sizeof(recv_buf));
       len = send_srs_request(ip_addr, SHELL_COMMAND, DATAON_FLAG_TOUCH_COMMAND,
-                             recv_buf, sizeof(recv_buf), 0);
+                             recv_buf, sizeof(recv_buf), 0, g_default_recv_timeout_ms);
       DEBUG_LOG_ALL("touch flag command sent: recv_len=%d", len);
       DEBUG_LOG_IMPORTANT("dataon attempt done: attempt=%d success=1 reason=req_pdusessconn", attempt);
       return 0;
@@ -569,9 +639,10 @@ int main(int argc, char **argv)
   dataon_thread_arg_type dataon_arg = {{0,}, DEFAULT_RETRY_INTERVAL_MS, DEFAULT_MAX_TRY};
   int dataon_worker_rc = 0;
   int signal_info_rc = 0;
+  int show_status = 0;
   int opt = 0;
 
-  while ((opt = getopt(argc, argv, "a:n:i:d:hv")) != -1) {
+  while ((opt = getopt(argc, argv, "a:n:i:d:t:shv")) != -1) {
     switch (opt) {
       case 'a':
         ip_addr = optarg;
@@ -594,6 +665,15 @@ int main(int argc, char **argv)
           return 1;
         }
         break;
+      case 't':
+        if (parse_timeout_arg(optarg) != 0) {
+          print_usage(argv[0]);
+          return 1;
+        }
+        break;
+      case 's':
+        show_status = 1;
+        break;
       case 'h':
         print_usage(argv[0]);
         return 0;
@@ -612,6 +692,11 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  if (show_status) {
+    print_data_status(ip_addr);
+    return 0;
+  }
+
   dataon_arg.interval = normalize_retry_interval_ms(dataon_arg.interval);
   dataon_arg.max_try = normalize_max_try(dataon_arg.max_try);
   if (g_debug_level < DEBUG_LEVEL_DISABLE || g_debug_level > DEBUG_LEVEL_IMPORTANT) {
@@ -620,13 +705,12 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  DEBUG_LOG_IMPORTANT("main start: ip=%s interval_ms=%d max_try=%d debug_level=%d",
+  DEBUG_LOG_IMPORTANT("main start: ip=%s interval_ms=%d max_try=%d debug_level=%d default_timeout_ms=%d dataon_timeout_ms=%d",
                       ip_addr, dataon_arg.interval, dataon_arg.max_try,
-                      g_debug_level
-  );
+                      g_debug_level, g_default_recv_timeout_ms, g_dataon_recv_timeout_ms);
 
-  if (g_debug_level != DEBUG_LEVEL_DISABLE)
-    log_srs_status_info();
+  //if (g_debug_level != DEBUG_LEVEL_DISABLE)
+  //  log_srs_status_info();
 
   signal_info_rc = run_signal_info(ip_addr, dataon_arg.interval, dataon_arg.max_try);
   if (signal_info_rc == 0) {
